@@ -1,64 +1,235 @@
+
 export default {
   async fetch(request, env) {
+
     const origin = request.headers.get("Origin");
+
     const allowedOrigins = [
       "https://paikarisell.ghotimarket.com"
     ];
 
     const corsHeaders = {
-      "Access-Control-Allow-Origin": allowedOrigins.includes(origin) ? origin : "https://paikarisell.ghotimarket.com",
+      "Access-Control-Allow-Origin": allowedOrigins.includes(origin)
+        ? origin
+        : "https://paikarisell.ghotimarket.com",
       "Access-Control-Allow-Methods": "POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Content-Type": "application/json"
     };
 
-    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
-    if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: corsHeaders });
+    const jsonResponse = (data, status = 200) => {
+      return new Response(JSON.stringify(data), {
+        status,
+        headers: corsHeaders
+      });
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders
+      });
+    }
+
+    if (request.method !== "POST") {
+      return jsonResponse({
+        success: false,
+        error: "Method not allowed"
+      }, 405);
+    }
 
     try {
+
+      // 1. Authorization Check
+
       const authHeader = request.headers.get("Authorization");
+
       if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: corsHeaders });
+        return jsonResponse({
+          success: false,
+          error: "Authorization token missing"
+        }, 401);
       }
 
-      const idToken = authHeader.split("Bearer ")[1];
-      const verifyRes = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=AIzaSyDCIRWmozT0XcEXuXtQ6RDiDo6vtT1T9mU`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ idToken })
-      });
+      const idToken = authHeader.substring(7);
 
-      if (!verifyRes.ok) return new Response(JSON.stringify({ success: false, error: "Invalid token" }), { status: 403, headers: corsHeaders });
+
+      // 2. Firebase Token Verification
+
+      const verifyRes = await fetch(
+        "https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=" +
+        "YOUR_FIREBASE_API_KEY",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            idToken: idToken
+          })
+        }
+      );
+
+      if (!verifyRes.ok) {
+        return jsonResponse({
+          success: false,
+          error: "Firebase authentication failed"
+        }, 403);
+      }
+
       const userData = await verifyRes.json();
+
+      if (!userData.users || !userData.users[0]) {
+        return jsonResponse({
+          success: false,
+          error: "User not found"
+        }, 403);
+      }
+
       const uid = userData.users[0].localId;
 
-      // Fetch Firestore Document for verification & secure info extraction
-      const firestoreRes = await fetch(`https://firestore.googleapis.com/v1/projects/paikarisell-ghotimarket/databases/(default)/documents/supplyers/${uid}`);
-      if (!firestoreRes.ok) return new Response(JSON.stringify({ success: false, error: "Supplier doc not found" }), { status: 404, headers: corsHeaders });
-      
+
+      // 3. Firestore Document Fetch
+
+      const firestoreRes = await fetch(
+        `https://firestore.googleapis.com/v1/projects/paikarisell-ghotimarket/databases/(default)/documents/supplyers/${uid}`,
+        {
+          method: "GET",
+          headers: {
+            "Authorization": `Bearer ${idToken}`
+          }
+        }
+      );
+
+      if (!firestoreRes.ok) {
+
+        const errorText = await firestoreRes.text();
+
+        return jsonResponse({
+          success: false,
+          error: "Firestore fetch failed",
+          details: errorText
+        }, 403);
+
+      }
+
       const docData = await firestoreRes.json();
-      const fields = docData.fields;
 
-      const name = fields.name.stringValue;
-      const email = fields.email.stringValue;
-      const phone = fields.phone.stringValue;
-      const whatsApp = fields.whatsApp.stringValue;
-      const description = fields.description.stringValue;
-      const banglaTime = new Date().toLocaleString("bn-BD", { timeZone: "Asia/Dhaka" });
+      const fields = docData.fields || {};
 
-      const message = `🔔 নতুন Supplier Registration\n\nনাম: ${name}\nইমেইল: ${email}\nহোয়াটসঅ্যাপ: ${whatsApp}\nমোবাইল: ${phone}\nপণ্যের বিবরণ: ${description}\nUID: ${uid}\nসময়: ${banglaTime}\nStatus: Verification Pending`;
 
-      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: env.TELEGRAM_CHAT_ID,
-          text: message
-        })
+      // 4. Safe Field Extraction
+
+      const getField = (key) => {
+        const field = fields[key];
+
+        if (!field) return "Not provided";
+
+        return (
+          field.stringValue ??
+          field.integerValue ??
+          field.doubleValue ??
+          field.booleanValue ??
+          "Not provided"
+        );
+      };
+
+      const name = getField("name");
+      const email = getField("email");
+      const phone = getField("phone");
+      const whatsApp = getField("whatsApp");
+      const description = getField("description");
+
+
+      // 5. Bangladesh Time
+
+      const banglaTime = new Date().toLocaleString(
+        "bn-BD",
+        {
+          timeZone: "Asia/Dhaka",
+          dateStyle: "full",
+          timeStyle: "medium"
+        }
+      );
+
+
+      // 6. Telegram Message
+
+      const message =
+`🔔 নতুন Supplier Registration
+
+👤 নাম: ${name}
+📧 ইমেইল: ${email}
+📱 মোবাইল: ${phone}
+💬 WhatsApp: ${whatsApp}
+
+📦 পণ্যের বিবরণ:
+${description}
+
+🆔 UID:
+${uid}
+
+🕒 সময়: ${banglaTime}
+
+⏳ Status: Verification Pending
+
+━━━━━━━━━━━━━━━━━━
+PAIKARI SELL
+Supplier Registration System`;
+
+
+      // 7. Telegram Notification
+
+      if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+        return jsonResponse({
+          success: false,
+          error: "Telegram environment variables missing"
+        }, 500);
+      }
+
+      const telegramRes = await fetch(
+        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            chat_id: env.TELEGRAM_CHAT_ID,
+            text: message
+          })
+        }
+      );
+
+      const telegramData = await telegramRes.json();
+
+      if (!telegramRes.ok || !telegramData.ok) {
+
+        return jsonResponse({
+          success: false,
+          error: "Telegram notification failed",
+          details: telegramData.description || "Unknown Telegram error"
+        }, 502);
+
+      }
+
+
+      // 8. Success Response
+
+      return jsonResponse({
+        success: true,
+        message: "Supplier notification sent successfully",
+        uid: uid
       });
 
-      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-    } catch (err) {
-      return new Response(JSON.stringify({ success: false, error: err.message }), { status: 500, headers: corsHeaders });
+    } catch (error) {
+
+      return jsonResponse({
+        success: false,
+        error: error.message
+      }, 500);
+
     }
+
   }
 };
